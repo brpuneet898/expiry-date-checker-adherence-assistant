@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/services/noti_serve.dart';
+import 'package:frontend/services/medication_log_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dashboard_screen.dart';
@@ -9,11 +11,36 @@ import 'theme_constants.dart';
 import 'package:flutter/services.dart';
 import 'expiry-date-check.dart';
 import 'medicine-name-reader.dart';
+import 'services/auth_service.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  NotiService().initNotification();
+  // Initialize services in the same context to ensure synchronization
+  print('📱 Initializing services in main context...');
+  
+  // Initialize MedicationLogService first to establish SharedPreferences context
+  await MedicationLogService.initialize();
+  
+  // Initialize NotificationService in same context
+  final notiService = NotiService();
+  await notiService.initNotification();
+  
+  // Force a context marker to verify notification/UI synchronization
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('main_context_init', DateTime.now().toIso8601String());
+    print('✅ Main context marker set');
+    
+    // Verify we can see all expected keys
+    final allKeys = prefs.getKeys();
+    print('📱 MAIN CONTEXT KEYS: $allKeys');
+  } catch (e) {
+    print('❌ Error setting main context marker: $e');
+  }
+  
+  print('✅ All services initialized in main context');
+
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     // DeviceOrientation.portraitDown,
@@ -61,9 +88,54 @@ class _MyHomePageState extends State<MyHomePage> {
   final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   bool _isPasswordVisible = false;
+  bool _isCheckingStoredCredentials = true;
 
   @override
+  void initState() {
+    super.initState();
+    _checkStoredCredentials();
+  }
+  Future<void> _checkStoredCredentials() async {
+    final credentials = await AuthService.getStoredCredentials();
+    
+    if (credentials != null) {
+      // Auto-login with stored credentials
+      await _performLogin(credentials['username']!, credentials['password']!, isAutoLogin: true);
+    } else {
+      setState(() {
+        _isCheckingStoredCredentials = false;
+      });
+    }
+  }
+  Future<void> _saveCredentials(String username, String password) async {
+    await AuthService.saveCredentials(username, password);
+  }
+  @override
   Widget build(BuildContext context) {
+    // Show loading screen while checking stored credentials
+    if (_isCheckingStoredCredentials) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(
+                color: ThemeConstants.primaryColor,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Checking login status...',
+                style: TextStyle(
+                  color: Colors.grey[600],
+                  fontSize: 16,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
@@ -315,40 +387,72 @@ class _MyHomePageState extends State<MyHomePage> {
       ),
     );
   }
-
   void _handleSignIn() async {
     if (_formKey.currentState!.validate()) {
-      try {
-        final response = await http.post(
-          Uri.parse('$baseUrl/login'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'username': _usernameController.text,
-            'password': _passwordController.text,
-          }),
-        );
+      await _performLogin(_usernameController.text, _passwordController.text);
+    }
+  }
 
-        if (response.statusCode == 200) {
-          final userData = jsonDecode(response.body);
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-                builder: (context) => DashboardScreen(
-                      username:
-                          userData["username"] ?? _usernameController.text,
-                      password:
-                          userData["password"] ?? _passwordController.text,
-                    )),
-          );
+  Future<void> _performLogin(String username, String password, {bool isAutoLogin = false}) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': username,
+          'password': password,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final userData = jsonDecode(response.body);
+        
+        // Save credentials for future auto-login
+        await _saveCredentials(username, password);
+        
+        // Navigate to dashboard
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (context) => DashboardScreen(
+              username: userData["username"] ?? username,
+              password: userData["password"] ?? password,
+            ),
+          ),
+        );
+      } else {        if (isAutoLogin) {
+          // If auto-login fails, clear stored credentials and show login screen
+          await AuthService.clearStoredCredentials();
+          if (mounted) {
+            setState(() {
+              _isCheckingStoredCredentials = false;
+            });
+          }
         } else {
+          // Show error for manual login
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Invalid username or password')),
+            );
+          }
+        }
+      }
+    } catch (e) {      if (isAutoLogin) {
+        // If auto-login fails due to connection error, clear credentials and show login screen
+        await AuthService.clearStoredCredentials();
+        if (mounted) {
+          setState(() {
+            _isCheckingStoredCredentials = false;
+          });
+        }
+      } else {
+        // Show error for manual login
+        if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Invalid username or password')),
+            const SnackBar(content: Text('Connection error')),
           );
         }
-      } catch (e) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Connection error')),
-        );
       }
     }
   }

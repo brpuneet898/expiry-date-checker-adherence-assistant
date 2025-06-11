@@ -42,13 +42,18 @@ dependencies:
   timezone: ^0.10.1
   flutter_timezone: ^4.1.0
   just_audio: ^0.10.2
-  path_provider: ^2.1.5  
+  path_provider: ^2.1.5
   record: ^6.0.0
-  camera: ^0.10.5+9
+  shared_preferences: ^2.3.2
+  camera: ^0.10.5+9  
   image: ^4.1.3
   speech_to_text: ^7.0.0
   flutter_svg: ^2.1.0
-  intl: ^0.20.2
+  intl: ^0.20.2  
+  fl_chart: ^0.68.0  
+  pdf: ^3.10.4
+  printing: ^5.12.0
+  open_file: ^3.3.2
 
 dev_dependencies:
   flutter_test:
@@ -76,6 +81,7 @@ flutter:
     - assets/success.gif
     - assets/scanning.json
     - assets/listening.json
+    - assets/listening-blue.json
     - assets/listening-your-whispers.json
     - assets/notification_sound.wav
     - assets/logo.png

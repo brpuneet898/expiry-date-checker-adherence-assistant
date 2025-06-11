@@ -6,6 +6,100 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:frontend/services/medication_log_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+// Global constants for action IDs
+const String medTakenActionId = 'med_taken_action';
+const String medForgotActionId = 'med_forgot_action';
+
+// Background notification response handler (must be top-level function)
+@pragma('vm:entry-point')
+Future<void> onDidReceiveNotificationResponse(NotificationResponse response) async {
+  // CRITICAL: Initialize Flutter binding for background context
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  print('🔔 Notification response received: ${response.actionId}');
+  print('🔔 Payload: ${response.payload}');
+    // CRITICAL: Force SharedPreferences to use the same context as main app
+  await _ensureSharedContext();
+  
+  if (response.payload == null || response.payload!.isEmpty) {
+    print('❌ No payload found in notification');
+    return;
+  }
+  
+  try {
+    Map<String, dynamic> payload = jsonDecode(response.payload!);
+    String medicineName = payload['medicine'] ?? 'Unknown Medicine';
+    String reminderTimeStr = payload['scheduled_time'] ?? DateTime.now().toIso8601String();
+    DateTime reminderTime = DateTime.parse(reminderTimeStr);
+    
+    print('🔔 Medicine: $medicineName, Time: $reminderTime');
+    
+    // CRITICAL: Initialize MedicationLogService to use same context
+    await MedicationLogService.initialize();
+    
+    if (response.actionId == medTakenActionId) {
+      print('✅ Logging TAKEN action');
+      await MedicationLogService.logMedicationAction(
+        action: 'taken',
+        medicineName: medicineName,
+        reminderTime: reminderTime,
+        actionTime: DateTime.now(),
+      );
+      print('✅ TAKEN action logged successfully');
+    } else if (response.actionId == medForgotActionId) {
+      print('❌ Logging FORGOT action');
+      await MedicationLogService.logMedicationAction(
+        action: 'forgot',
+        medicineName: medicineName,
+        reminderTime: reminderTime,
+        actionTime: DateTime.now(),
+      );
+      print('❌ FORGOT action logged successfully');
+    }
+    
+    // Verify the log was stored and can be retrieved
+    final logs = await MedicationLogService.getMedicationLogs();
+    print('🔔 VERIFICATION: ${logs.length} total logs now stored');
+    
+  } catch (e) {
+    print('❌ Error handling notification response: $e');
+  }
+}
+
+// Ensure notification context uses same SharedPreferences as main app
+Future<void> _ensureSharedContext() async {
+  try {
+    // Force initialization of SharedPreferences in notification context
+    final prefs = await SharedPreferences.getInstance();
+    final allKeys = prefs.getKeys();
+    print('🔔 NOTIFICATION CONTEXT KEYS: $allKeys');
+    
+    // Check if we can see the UI context keys (username, password)
+    if (allKeys.contains('username') && allKeys.contains('password')) {
+      print('✅ SUCCESS: Notification context matches UI context');
+    } else {
+      print('⚠️ WARNING: Notification context differs from UI context');
+      print('🔔 Available keys: $allKeys');
+      
+      // Try to create a sync marker that UI can check
+      await prefs.setString('notification_context_active', DateTime.now().toIso8601String());
+      print('🔔 Set notification context marker');
+    }
+    
+    // Check if medication_logs key exists in this context
+    final medLogs = prefs.getString('medication_logs');
+    if (medLogs != null) {
+      print('✅ MEDICATION LOGS FOUND in notification context: ${medLogs.length} chars');
+    } else {
+      print('❌ NO MEDICATION LOGS in notification context - will create new storage');
+    }
+  } catch (e) {
+    print('❌ Context check failed: $e');
+  }
+}
 
 class NotiService {
   final notificationsPlugin = FlutterLocalNotificationsPlugin();
@@ -31,58 +125,117 @@ class NotiService {
     if (await Permission.ignoreBatteryOptimizations.isDenied) {
       await Permission.ignoreBatteryOptimizations.request();
     }
-    const initSettingsAndroid =
-        AndroidInitializationSettings('@mipmap/ic_launcher');
-    const initSettingsIOS = DarwinInitializationSettings(
-      requestAlertPermission: true,
-      requestBadgePermission: true,
-      requestSoundPermission: true,
+
+    // Initialize notification channels with actions
+    const AndroidNotificationChannel channel = AndroidNotificationChannel(
+      'daily_medicine_reminder',
+      'Daily Medicine Reminder',
+      description: 'Daily Medicine Reminder',
+      importance: Importance.max,
+      playSound: true,
     );
-    const initSettings = InitializationSettings(
-      android: initSettingsAndroid,
-      iOS: initSettingsIOS,
-    );
+
     await notificationsPlugin
         .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(const AndroidNotificationChannel(
-          'daily_medicine_reminder',
-          'Daily Medicine Reminder',
-          description: 'Daily Medicine Reminder',
-          importance: Importance.max,
-          playSound: true, // Add this
-          // sound: RawResourceAndroidNotificationSound('notification_sound'),
-        ));
-    await notificationsPlugin.initialize(initSettings);
+        ?.createNotificationChannel(channel);
+
+    // Initialize with action handling
+    const initSettingsAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
+    var initSettingsIOS = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+      notificationCategories: [          DarwinNotificationCategory(
+          'med_reminder_category',
+          actions: [
+            DarwinNotificationAction.plain(
+              medTakenActionId,
+              'TAKEN',
+              options: {
+                DarwinNotificationActionOption.foreground,
+              },
+            ),
+            DarwinNotificationAction.plain(
+              medForgotActionId,
+              'MISSED',
+              options: {
+                DarwinNotificationActionOption.foreground,
+              },
+            ),
+          ],
+        )
+      ],
+    );
+
+    var initSettings = InitializationSettings(
+      android: initSettingsAndroid,
+      iOS: initSettingsIOS,
+    );    await notificationsPlugin.initialize(
+      initSettings,      
+      onDidReceiveNotificationResponse: onDidReceiveNotificationResponse,
+    );
+
     _isInitialized = true;
   }
+  NotificationDetails _notificationDetails() {    // Android actions
+    const AndroidNotificationAction medTakenAction = AndroidNotificationAction(
+      medTakenActionId,
+      'TAKEN',
+      cancelNotification: true, // This will dismiss the notification when tapped
+      // titleColor: Color.fromARGB(255, 76, 175, 80), // Green text color
+      // contextual: true,
+    );
 
-  NotificationDetails notificationDetails() {
+    const AndroidNotificationAction medForgotAction = AndroidNotificationAction(
+      medForgotActionId,
+      'MISSED',
+      cancelNotification: true, // This will dismiss the notification when tapped
+      // titleColor: Color.fromARGB(255, 244, 67, 54), // Red text color
+      // contextual: true,
+    );// Android details
+    const androidDetails = AndroidNotificationDetails(
+      "daily_medicine_reminder",
+      "Daily Medicine Reminder",
+      channelDescription: "Daily Medicine Reminder",
+      importance: Importance.max,
+      priority: Priority.high,
+      sound: RawResourceAndroidNotificationSound('notification_sound'),
+      playSound: true,
+      ongoing: true, // Makes notification persistent
+      autoCancel: false, // Notification won't auto dismiss
+      actions: [medTakenAction, medForgotAction], // Add action buttons
+      color: Color.fromARGB(255, 76, 175, 80), // Green color for positive action indication
+    );
+
+    // iOS details
+    const iosDetails = DarwinNotificationDetails(
+      sound: 'notification_sound.wav',
+      presentSound: true,
+      presentAlert: true,
+      presentBadge: true,
+      categoryIdentifier: 'med_reminder_category',
+    );
+
     return const NotificationDetails(
-        android: AndroidNotificationDetails(
-          "daily_medicine_reminder",
-          "Daily Medicine Reminder",
-          channelDescription: "Daily Medicine Reminder",
-          importance: Importance.max,
-          priority: Priority.high,
-          sound: RawResourceAndroidNotificationSound(
-              'notification_sound'), // Remove .wav extension
-          playSound: true,
-        ),
-        iOS: DarwinNotificationDetails(
-          sound: 'notification_sound.wav',
-          presentSound: true,
-          presentAlert: true,
-          presentBadge: true,
-        ));
+      android: androidDetails,
+      iOS: iosDetails,
+    );
   }
 
-  // Use the notificationDetails in showNotification
-  Future<void> showNotification(
-      {int id = 0, String? title, String? body}) async {
-    return notificationsPlugin.show(id, title, body,
-        notificationDetails() // Use the configured details instead of empty one
-        );
+  Future<void> showNotification({
+    int id = 0,
+    String? title,
+    String? body,
+    String? payload,
+  }) async {
+    await notificationsPlugin.show(
+      id,
+      title,
+      body,
+      _notificationDetails(),
+      payload: payload,
+    );
   }
 
   Future<void> scheduleNotification({
@@ -93,23 +246,15 @@ class NotiService {
     required int minute,
   }) async {
     try {
-      // Ensure initialization
       if (!_isInitialized) await initNotification();
       final medName = body.replaceFirst('Time to take ', '');
       final id = '${medName}_${hour}_$minute'.hashCode;
 
-      final now = tz.TZDateTime.now(tz.local);
-      var scheduledDate =
-          tz.TZDateTime(tz.local, now.year, now.month, now.day, hour, minute);
-
-      // Handle past times
-      if (scheduledDate.isBefore(now)) {
-        scheduledDate = scheduledDate.add(const Duration(days: 1));
-      }
+      final scheduledDate = _nextInstanceOfTime(hour, minute);
 
       debugPrint("""
         Scheduling notification:
-        - Now: $now
+        - Now: ${tz.TZDateTime.now(tz.local)}
         - Scheduled: $scheduledDate
         - Timezone: ${tz.local.name}
         """);
@@ -118,34 +263,27 @@ class NotiService {
         id,
         title,
         body,
-        _nextInstanceOfTime(hour, minute),
-        notificationDetails(),
+        scheduledDate,
+        _notificationDetails(),
         androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
         matchDateTimeComponents: DateTimeComponents.time,
         payload: jsonEncode({
-          'medicine': body.replaceFirst('Time to take ', ''),
+          'medicine': medName,
           'hour': hour,
           'minute': minute,
+          'scheduled_time': scheduledDate.toIso8601String(),
         }),
       );
-      debugPrint(
-          "Notification scheduled successfully for $hour:$minute"); // Add logging
+      debugPrint("Notification scheduled successfully for $hour:$minute");
     } catch (e) {
-      debugPrint("Error scheduling notification: $e"); // Add error logging
+      debugPrint("Error scheduling notification: $e");
       rethrow;
     }
   }
 
   tz.TZDateTime _nextInstanceOfTime(int hour, int minute) {
-    final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
-    tz.TZDateTime scheduledDate = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      hour,
-      minute,
-    );
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduledDate = tz.TZDateTime(tz.local, now.year, now.month, now.day, hour, minute);
 
     if (scheduledDate.isBefore(now)) {
       scheduledDate = scheduledDate.add(const Duration(days: 1));
@@ -275,5 +413,57 @@ class NotiService {
       // Include if it's either in the future or within the last 30 minutes
       return scheduledTime.isAfter(now.subtract(const Duration(minutes: 30)));
     }).toList();
+  }
+
+  // Test method to create a notification and test the actions
+  Future<void> testNotificationActions() async {
+    if (!_isInitialized) await initNotification();
+    
+    try {
+      final now = DateTime.now();
+      final testTime = now.add(const Duration(seconds: 5));
+      
+      await notificationsPlugin.show(
+        999, // Test notification ID
+        'TEST NOTIFICATION',
+        'Tap the buttons to test logging - Test Medicine',
+        _notificationDetails(),
+        payload: jsonEncode({
+          'medicine': 'Test Medicine',
+          'scheduled_time': testTime.toIso8601String(),
+        }),
+      );
+      
+      print('🧪 Test notification created - tap the action buttons to test logging');
+    } catch (e) {
+      print('❌ Error creating test notification: $e');
+    }
+  }
+
+  // Test method to manually trigger notification response handler
+  Future<void> testContextSynchronization() async {
+    print('🧪 Testing context synchronization manually...');
+    
+    try {
+      // Create a mock notification response
+      final testPayload = jsonEncode({
+        'medicine': 'Context Test Medicine',
+        'scheduled_time': DateTime.now().toIso8601String(),
+      });
+      
+      // Simulate the notification response
+      final mockResponse = NotificationResponse(
+        notificationResponseType: NotificationResponseType.selectedNotificationAction,
+        actionId: medTakenActionId,
+        payload: testPayload,
+      );
+      
+      print('🧪 Manually calling notification response handler...');
+      await onDidReceiveNotificationResponse(mockResponse);
+      
+      print('✅ Context synchronization test completed');
+    } catch (e) {
+      print('❌ Error in context synchronization test: $e');
+    }
   }
 }

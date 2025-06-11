@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
 class ThemeConstants {
-  static const Color primaryColor = Color(0xFF02979c);
-  static const Color secondaryColor = Color(0xFF063e58);
+  static const Color primaryColor = Color(0xFF0A66AC);
+  static const Color secondaryColor = Color.fromARGB(255, 0, 84, 123);
   
   // You can add more theme-related constants here
   static const double borderRadius = 12.0;

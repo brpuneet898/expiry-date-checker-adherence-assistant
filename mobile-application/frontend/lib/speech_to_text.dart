@@ -219,8 +219,8 @@ class _SpeechToTextExampleState extends State<SpeechToTextExample> {
           partialResults: true,
           listenFor:
               const Duration(seconds: 300), // Increased from 60 to 300 seconds
-          pauseFor: const Duration(seconds: 5), // Increased from 3 to 5 seconds
-          localeId: 'en_US',
+          pauseFor: const Duration(seconds: 5),
+          localeId: 'hi-IN',
           cancelOnError: false,
           onSoundLevelChange:
               null, // Removed sound level monitoring to reduce overhead

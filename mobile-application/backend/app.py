@@ -27,6 +27,10 @@ from rapidfuzz import process, fuzz
 # Type Hints
 from typing import Dict, Any, List
 import requests
+# Email functionality
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
@@ -147,7 +151,7 @@ def getUserData():
             "prescriptions": sorted([
                 {
                 "pres_id": p.pres_id,
-                "med_id": p.med_id,
+                "medicine_id": p.med_id,
                 "medicine_name": m.med_name,
                 "recommended_dosage": m.recommended_dosage,
                 "side_effects": m.side_effects,
@@ -177,6 +181,36 @@ def getMedicine():
     }
     return response, 200 if fetchMed else 404
 
+@app.route("/get-med-info", methods=["GET"])
+def getMedicineInfo():
+    med_name = request.args.get("med_name", "")
+    if med_name:
+        fetchMeds = Medicines.query.filter(Medicines.med_name == med_name).first()
+        prompt = f"""
+        You are a medical assistant. You would be given a medicine name and you have to return the information about the medicine in a valid JSON format.
+
+        Medicine Name: {fetchMeds.med_name if fetchMeds else "None"}
+        The information should include just the information publically available about the medicine.
+        Incase you have no information avaible about the medicine, return "Information not available".
+        The information should be in text format and should not include any HTML tags or any other formatting. It shoud be 50 words in length.
+
+        # Example Input/Output:
+        Input: Paracetamol
+        Output:
+        {{
+            "med_name": "Paracetamol",
+            "info": <information about the medicine>
+        }}
+        """
+        response = gemini_model.generate_content(prompt)
+        response = response.candidates[0].content.parts[0].text
+        print(response)
+        json_str = response.split('```json')[1].split('```')[0].strip()
+        response = json.loads(json_str)
+        print(response)
+        return response, 200
+    return "Medicine not available", 404
+
 @app.route("/add-medicine", methods=["POST"])
 def addMedicine():
     form = request.get_json()
@@ -202,14 +236,37 @@ def addPrescription():
     fetchMed = Medicines.query.filter_by(med_name=form["med_name"]).first()
     lastID = Prescriptions.query.order_by(Prescriptions.pres_id.desc()).first()
     next_id = nextID(lastID.pres_id) if lastID else "PRES0001"
+
+    prompt = f"""
+        I want you to recognise the date given below, for your reference today's date is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, the date given below should be in the range of -10 years to +10 years from the today's date.
+
+        Input date: {form["expiry_date"]}
+        You have to return the date in the format "YYYY-MM-DD HH:MM:SS".
+        If the date is not in the range of -10 years to +10 years from the today's date, still return it.
+        if the HH:MM:SS is not given, you have to return the date with the time as 00:00:00.
+
+        Also for this frequency value {form["frequency"]}, you have to return the number of times a day value in integer format.
+
+        Your response should be in JSON format with the following
+        {{
+            "expiry_date": "YYYY-MM-DD HH:MM:SS",
+            "frequency": integer_value_of_frequency
+        }}
+    """
+    response = gemini_model.generate_content(prompt)
+    response = response.candidates[0].content.parts[0].text
+    print(response)
+    json_str = response.split('```json')[1].split('```')[0].strip()
+    response = json.loads(json_str)
+    print(response)
     if fetchUser:
         if fetchMed:
             addPres = Prescriptions(
                 pres_id=next_id,
                 med_id=fetchMed.med_id,
                 user_id=fetchUser.user_id,
-                frequency=form["frequency"],
-            expiry_date=datetime.strptime(form["expiry_date"], "%Y-%m-%d %H:%M:%S")
+                frequency= int(response["frequency"]) if type(response["frequency"])!=int else response["frequency"],
+                expiry_date=datetime.strptime(response["expiry_date"], "%Y-%m-%d %H:%M:%S")
             )
             db.session.add(addPres)
             db.session.commit()
@@ -220,9 +277,9 @@ def addPrescription():
                 "recommended_dosage": form["recommended_dosage"],
                 "side_effects": form["side_effects"]
             }
-            add_med = requests.post("http://localhost:8000/add-medicine", json=add_med_body)
+            add_med = requests.post("http://localhost:8080/add-medicine", json=add_med_body)
             if add_med.status_code == 200:
-                add_pres = requests.post("http://localhost:8000/add-prescription", json=form)
+                add_pres = requests.post("http://localhost:8080/add-prescription", json=form)
                 if add_pres.status_code == 200:
                     return "Successfully Added", 200
                 else:
@@ -253,35 +310,65 @@ def get_similar_names():
 def transcribe():
     form = request.get_json()
     prompt = f"""
-        From the given text, extract the medicine name, frequency of intake, and the dates & times of intake.:
-        {form["transcription"]}
+        You are a multilingual medical language model assistant. From the following transcription — which may be in any of these languages or a mix of them: **Hindi, English, Bengali, Marathi, Tamil, Telugu, or Gujarati** — extract accurate and detailed medicine-related information.
 
-        I want you to take the current time which is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} and based on the given times in the text give exact dates and times in the "times" key of the response json.
-        The datetime format should be in yyyy-mm-dd HH:MM:SS.
+        Input Text:
+        "{form["transcription"]}"
 
-        Return ONLY valid JSON with these keys:
-        - "med_name" (string) [medicine name, rectify any minor spelling mistakes, Capitalise the first character]
-        - "frequency" (integer, times per day) [frequency of intake per day]
-        - "times" (list of time strings) [list of times in the format "yyyy-mm-dd HH:MM:SS"]
-        - "recommended_dosage" (string) [recommended dosage of the medicine like 500gm or 1 tablet]
-        - "side_effects" (string) [atmost 3 side effects of the medicine seperated by commas]
+        Current system datetime is: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-        Example input: "I have to take citrazine for 3 days at 5:00 p.m., 9:00 p.m., and 10:00 p.m. " [Given today is 2025-01-01]
-        Example output:
+        ### TASK:
+        Extract and return the following information in a **valid JSON format** only, using this schema:
+
+        - "med_name": (string) → Medicine name. Correct minor spelling errors, normalize transliterations across all supported scripts (e.g., "सिट्रैजीन", "সিট্রাজিন", "சிட்ரசின்" → "Citrazine"). Capitalize the first letter.
+        - "frequency": (integer or null) → Number of times the medicine is to be taken per day. If unclear or missing, return `null`.
+        - "times": (list of strings) → Convert stated or implied medicine intake times to exact 24-hour format datetimes for 3 consecutive days. Use "YYYY-MM-DD HH:MM:SS".
+        - "recommended_dosage": (string or null) → Dosage such as "1 tablet", "500mg", etc. Return `null` if not mentioned.
+        - "side_effects": (string or null) → Return up to 3 common side effects of the medicine, comma-separated. Return `null` if the medicine name is unrecognized or invalid.
+
+        ### ADDITIONAL NOTES:
+        - Input text may be **code-mixed or transliterated** across supported Indian languages and scripts.
+        - You must handle **regional scripts and phonetic spellings**, such as:
+        - Hindi (Devanagari): "सिट्रैजीन"
+        - Bengali: "সিট্রাজিন"
+        - Marathi: "सिट्राझिन"
+        - Tamil: "சிட்ரசின்"
+        - Telugu: "సిట్రజిన్"
+        - Gujarati: "સિટ્રાજિન"
+        - Roman transliterations like "citrazin", "cetrazin", "sitrajeen"
+        - Recognize time expressions like:
+        - Hindi: "5 बजे", "रात को 10 बजे"
+        - Bengali: "সন্ধ্যা ৭টা", "সকাল ৮টা"
+        - Marathi: "सकाळी ७", "रात्री ९"
+        - Tamil: "மாலை 6 மணி", "காலை 9"
+        - Telugu: "సాయంత్రం 6", "ఉదయం 7"
+        - Gujarati: "સાંજના 6 વાગ્યે", "સવારના 8"
+        - Translate all time references into proper 24-hour format datetime values for 3 consecutive days starting today.
+        - Assume dosage is to be repeated daily unless explicitly stated otherwise.
+        - If intake times are **not mentioned**, return `"times"` as an empty list.
+        - If medicine name is **invalid**, set `"med_name"`, `"recommended_dosage"`, and `"side_effects"` to `null`.
+        - Output **must be strictly valid JSON**, ready for parsing.
+
+        ### EXAMPLE:
+        Input (in Hindi): "मुझे 3 दिन तक सिट्रैजीन शाम को 5 बजे, 9 बजे और 10 बजे लेनी है।" (Assume today is 2025-01-01)
+
+        Output:
         {{
             "med_name": "Citrazine",
             "frequency": 3,
-            "times": ["2025-01-01 17:00:00", "2025-01-01 21:00:00", "2025-01-01 22:00:00", "2025-01-02 17:00:00", "2025-01-02 21:00:00", "2025-01-02 22:00:00", "2025-01-03 17:00:00", "2025-01-03 21:00:00", "2025-01-03 22:00:00"]
+            "times": [
+                "2025-01-01 17:00:00", "2025-01-01 21:00:00", "2025-01-01 22:00:00",
+                "2025-01-02 17:00:00", "2025-01-02 21:00:00", "2025-01-02 22:00:00",
+                "2025-01-03 17:00:00", "2025-01-03 21:00:00", "2025-01-03 22:00:00"
+            ],
             "recommended_dosage": "500mg",
             "side_effects": "Drowsiness, Dry mouth, Dizziness"
         }}
-        Incase the name of the medicine does not make any sense, return 'None' for that key, and for recommended_dosage, side_effects.
-        Incase the frequency is not mentioned, return None for that key.
-        Going with the logic that medicine is taken for 3 days, and the times are repeated each day.
-        The times should be in 24-hour format.
-        The times should be in the format "yyyy-mm-dd HH:MM:SS".
-        In case of no medicine name or frequency, return None for that key.
+
+        If any field cannot be determined with confidence, return `null` for that field only.
     """
+
+
     response = gemini_model.generate_content(prompt)
     response = response.candidates[0].content.parts[0].text
     json_str = response.split('```json')[1].split('```')[0].strip()
@@ -289,7 +376,7 @@ def transcribe():
     # print(response, type(response))
     # response = eval(response.text)
 
-    name_matches = requests.get(f"http://localhost:8000/get-similar-names?med_name={response['med_name']}").json()["matches"]
+    name_matches = requests.get(f"http://localhost:8080/get-similar-names?med_name={response['med_name']}").json()["matches"]
     response["similar-matches"] = [match[0] for match in name_matches]
 
     fetchMed = Medicines.query.filter_by(med_name=response["med_name"]).first()
@@ -451,7 +538,7 @@ def medicine_name_reader():
         json_str = response.split('```json')[1].split('```')[0].strip()
         response = json.loads(json_str)
 
-        name_matches = requests.get(f"http://localhost:8000/get-similar-names?med_name={response['medicine_name']}").json()["matches"]
+        name_matches = requests.get(f"http://localhost:8080/get-similar-names?med_name={response['medicine_name']}").json()["matches"]
         response["similar-matches"] = [match[0] for match in name_matches]
 
         fetchMed = Medicines.query.filter_by(med_name=response["medicine_name"]).first()
@@ -469,6 +556,10 @@ def medicine_name_reader():
 
     except Exception as e:
         return jsonify({"error": f"Failed to process image: {str(e)}"}), 500
+
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy'}, 200
 
 
 # Auxiliary functions
@@ -613,8 +704,7 @@ def try_compact_date(digits):
         if 1 <= month <= 12 and 1 <= day <= 31:
             return f"{year}-{month:02d}-{day:02d}"
     
-    # Try MMDDYYYY
-    if digits[4:].isdigit() and 2000 <= int(digits[4:]) <= 2050:
+    # Try MMDDYYYY    if digits[4:].isdigit() and 2000 <= int(digits[4:]) <= 2050:
         month, day, year = int(digits[:2]), int(digits[2:4]), int(digits[4:8])
         if 1 <= month <= 12 and 1 <= day <= 31:
             return f"{year}-{month:02d}-{day:02d}"
@@ -622,6 +712,93 @@ def try_compact_date(digits):
     return None
     
 
+@app.route('/send-email', methods=['POST'])
+def send_email():
+    """
+    Send email to a list of recipients
+    Expected JSON payload:
+    {
+        "emails": ["email1@example.com", "email2@example.com"],
+        "subject": "Email subject",
+        "message": "Email message content",
+        "sender_email": "sender@example.com",
+        "sender_password": "password"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['emails', 'subject', 'message', 'sender_email', 'sender_password']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+        
+        with open("authorization.json", "r") as f:
+            authorizaion = json.load(f)
+        emails = data['emails']
+        subject = data['subject']
+        message = data['message']
+        sender_email = authorizaion['email-address']
+        sender_password = authorizaion['email-password']
+        
+        # Validate emails list
+        if not isinstance(emails, list) or len(emails) == 0:
+            return jsonify({'error': 'emails must be a non-empty list'}), 400
+        
+        # Setup email server (Gmail SMTP)
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        
+        # Create SMTP session
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # Enable security
+        server.login(sender_email, sender_password)
+        
+        successful_sends = []
+        failed_sends = []
+        
+        # Send email to each recipient
+        for email in emails:
+            try:
+                # Create message
+                msg = MIMEMultipart()
+                msg['From'] = sender_email
+                msg['To'] = email
+                msg['Subject'] = subject
+                
+                # Add body to email
+                msg.attach(MIMEText(message, 'plain'))
+                
+                # Convert to string
+                text = msg.as_string()
+                
+                # Send email
+                server.sendmail(sender_email, email, text)
+                successful_sends.append(email)
+                
+            except Exception as e:
+                failed_sends.append({'email': email, 'error': str(e)})
+        
+        # Close the server
+        server.quit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Email sent to {len(successful_sends)} recipients',
+            'successful_sends': successful_sends,
+            'failed_sends': failed_sends,
+            'total_attempted': len(emails)
+        }), 200
+        
+    except smtplib.SMTPAuthenticationError:
+        return jsonify({'error': 'SMTP Authentication failed. Check email and password.'}), 401
+    except smtplib.SMTPException as e:
+        return jsonify({'error': f'SMTP error occurred: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, debug=True)

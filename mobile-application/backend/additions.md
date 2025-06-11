@@ -1,0 +1,3 @@
+- Hindi Translation
+- Smart Alert Excalation
+- Medicine About
